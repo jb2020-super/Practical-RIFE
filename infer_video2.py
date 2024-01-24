@@ -20,6 +20,19 @@ def pad_image(img, padding, fp16):
     else:
         return F.pad(img, padding)
 
+def infer_once(model, first, second, exp):
+    mid = model.inference(first, second, 0.5, 1.0)
+    exp -= 1
+    rst = []
+    if exp >= 1:
+        first_list = infer_once(model, first, mid, exp)
+        second_list = infer_once(model, mid, second, exp)
+        rst += first_list
+        rst.append(mid)
+        rst += second_list
+    else:
+        rst.append(mid)
+    return rst
 
 def infer_video(model, input, output, exp, is_slomo):
     vc = cv2.VideoCapture(input)
@@ -56,11 +69,13 @@ def infer_video(model, input, output, exp, is_slomo):
             second_tensor = torch.from_numpy(np.transpose(second, (2,0,1))).to(device, non_blocking=True).unsqueeze(0).float() / 255.
             second_tensor = pad_image(second_tensor, padding, False)
 
-            mid = model.inference(first_tensor, second_tensor, 0.5, 1.0)
-            mid = (mid[0] * 255.).byte().cpu().numpy().transpose(1, 2, 0)
-            mid = mid[:height, :, :]
+            mid_list = infer_once(model, first_tensor, second_tensor, args.exp)
             vw.write(first)
-            vw.write(mid)
+            for mid in mid_list:
+                mid = (mid[0] * 255.).byte().cpu().numpy().transpose(1, 2, 0)
+                mid = mid[:height, :, :]            
+                vw.write(mid)
+                
             first = second
             pbar.update(1)
 
