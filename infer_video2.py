@@ -11,6 +11,8 @@ import skvideo.io
 from queue import Queue, Empty
 from model.pytorch_msssim import ssim_matlab
 from train_log.RIFE_HDv3 import Model
+from scenedetect.detectors import ContentDetector, ThresholdDetector, AdaptiveDetector
+from scenedetect import open_video, SceneManager
 
 warnings.filterwarnings("ignore")
 
@@ -33,6 +35,38 @@ def infer_once(model, first, second, exp):
     else:
         rst.append(mid)
     return rst
+
+def scene_detect(first, second):
+    # Convert frames to grayscale
+    first_gray = cv2.cvtColor(first, cv2.COLOR_BGR2GRAY)
+    second_gray = cv2.cvtColor(second, cv2.COLOR_BGR2GRAY)
+
+    # Compute absolute difference between frames
+    diff = cv2.absdiff(first_gray, second_gray)
+
+    # Set a threshold to identify significant changes
+    _, threshold_diff = cv2.threshold(diff, 30, 255, cv2.THRESH_BINARY)
+
+    # Count non-zero pixels in the thresholded difference
+    non_zero_count = cv2.countNonZero(threshold_diff)
+    print(non_zero_count)
+scene_list = []
+cnt = 1
+# Callback to invoke on the first frame of every new scene detection.
+def on_new_scene(frame_img: np.ndarray, frame_num: int):
+    global cnt, scene_list
+    print("{} New scene found at frame {}.".format(cnt, frame_num))
+    cnt += 1
+    scene_list.append(frame_num)
+    
+def get_scene_list(video_path):
+    
+
+    video = open_video(video_path)
+    scene_manager = SceneManager()
+    scene_manager.add_detector(AdaptiveDetector(adaptive_threshold=1.5, min_scene_len=5))
+    scene_manager.detect_scenes(video=video, callback=on_new_scene)
+    return scene_list
 
 def infer_video(model, input, output, exp, is_slomo):
     vc = cv2.VideoCapture(input)
@@ -58,29 +92,48 @@ def infer_video(model, input, output, exp, is_slomo):
 
     rst, first = vc.read()
     eof = not rst
+    ada_detector = AdaptiveDetector(adaptive_threshold=1.5, min_scene_len=5)
+    scene_list = get_scene_list(input)
+    fno = 0
+    scene_idx = 0
     with tqdm(total=int(total_frame)) as pbar:
         while not eof:
             rst, second = vc.read()
             if not rst:
                 eof = True
                 break
-            first_tensor = torch.from_numpy(np.transpose(first, (2,0,1))).to(device, non_blocking=True).unsqueeze(0).float() / 255.
-            first_tensor = pad_image(first_tensor, padding, False)
-            second_tensor = torch.from_numpy(np.transpose(second, (2,0,1))).to(device, non_blocking=True).unsqueeze(0).float() / 255.
-            second_tensor = pad_image(second_tensor, padding, False)
+            fno += 1
+            is_scene_change = False
+            if scene_idx < len(scene_list) and fno == scene_list[scene_idx]:
+                is_scene_change = True
+                scene_idx += 1
+            #is_scene_change = scene_detect(first, second)
 
-            mid_list = infer_once(model, first_tensor, second_tensor, args.exp)
-            vw.write(first)
-            for mid in mid_list:
-                mid = (mid[0] * 255.).byte().cpu().numpy().transpose(1, 2, 0)
-                mid = mid[:height, :, :]            
-                vw.write(mid)
-                
+            if is_scene_change:
+                n = 2 ** exp
+                step = 1.0 / n
+                for alpha in np.arange(step, 1, step):
+                    mid = cv2.addWeighted(first, 1 - alpha, second, alpha, 0)
+                    vw.write(mid)
+            else:
+                first_tensor = torch.from_numpy(np.transpose(first, (2,0,1))).to(device, non_blocking=True).unsqueeze(0).float() / 255.
+                first_tensor = pad_image(first_tensor, padding, False)
+                second_tensor = torch.from_numpy(np.transpose(second, (2,0,1))).to(device, non_blocking=True).unsqueeze(0).float() / 255.
+                second_tensor = pad_image(second_tensor, padding, False)
+
+                mid_list = infer_once(model, first_tensor, second_tensor, args.exp)
+                vw.write(first)
+                for mid in mid_list:
+                    mid = (mid[0] * 255.).byte().cpu().numpy().transpose(1, 2, 0)
+                    mid = mid[:height, :, :]
+                    vw.write(mid)
+                    
             first = second
             pbar.update(1)
 
 
-
+# python .\infer_video2.py -i d:\VFI-Data\VFITestDataSet\vimeo\AUTOPILOTS-25fps.mp4 -o D:\VFI-Data\RIFEv4.14\VFITestDataSet\autopilots-4x-slomo-v4-blend.mp4 --slomo --exp 2
+#
 
 if __name__ == '__main__':
     argp = argparse.ArgumentParser()
