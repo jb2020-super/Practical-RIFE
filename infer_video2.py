@@ -60,13 +60,34 @@ def on_new_scene(frame_img: np.ndarray, frame_num: int):
     scene_list.append(frame_num)
     
 def get_scene_list(video_path):
-    
-
     video = open_video(video_path)
     scene_manager = SceneManager()
     scene_manager.add_detector(AdaptiveDetector(adaptive_threshold=1.5, min_scene_len=5))
     scene_manager.detect_scenes(video=video, callback=on_new_scene)
     return scene_list
+
+def interpolate(model, first, second, padding, exp):
+    height, width, _ = first.shape
+    first_tensor = torch.from_numpy(np.transpose(first, (2,0,1))).to(device, non_blocking=True).unsqueeze(0).float() / 255.
+    first_tensor = pad_image(first_tensor, padding, False)
+    second_tensor = torch.from_numpy(np.transpose(second, (2,0,1))).to(device, non_blocking=True).unsqueeze(0).float() / 255.
+    second_tensor = pad_image(second_tensor, padding, False)
+
+    mid_list = infer_once(model, first_tensor, second_tensor, exp)
+    mid_list_out = []
+    for mid in mid_list:
+        mid = (mid[0] * 255.).byte().cpu().numpy().transpose(1, 2, 0)
+        mid = mid[:height, :width, :]
+        
+        mid_list_out.append(mid)
+    return mid_list_out
+
+def get_padding(height, width, scale):
+    tmp = max(128, int(128 / scale))
+    ph = ((height - 1) // tmp + 1) * tmp
+    pw = ((width - 1) // tmp + 1) * tmp
+    padding = (0, pw - width, 0, ph - height)    
+    return padding
 
 def infer_video(model, input, output, exp, is_slomo):
     vc = cv2.VideoCapture(input)
@@ -78,6 +99,9 @@ def infer_video(model, input, output, exp, is_slomo):
     width = int(vc.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(vc.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
+    need_slice = False
+    if width > 1920 or height > 1080:
+        need_slice = True
     out_width = width
     out_height = height
     out_fps = fps
@@ -85,10 +109,7 @@ def infer_video(model, input, output, exp, is_slomo):
         out_fps = fps * (2 ** exp)
     vw = cv2.VideoWriter(output, cv2.VideoWriter_fourcc(*'mp4v'), out_fps, (out_width, out_height))
 
-    tmp = max(128, int(128 / args.scale))
-    ph = ((height - 1) // tmp + 1) * tmp
-    pw = ((width - 1) // tmp + 1) * tmp
-    padding = (0, pw - width, 0, ph - height)
+    padding = get_padding(height, width, args.scale)
 
     rst, first = vc.read()
     eof = not rst
@@ -116,17 +137,43 @@ def infer_video(model, input, output, exp, is_slomo):
                     mid = cv2.addWeighted(first, 1 - alpha, second, alpha, 0)
                     vw.write(mid)
             else:
-                first_tensor = torch.from_numpy(np.transpose(first, (2,0,1))).to(device, non_blocking=True).unsqueeze(0).float() / 255.
-                first_tensor = pad_image(first_tensor, padding, False)
-                second_tensor = torch.from_numpy(np.transpose(second, (2,0,1))).to(device, non_blocking=True).unsqueeze(0).float() / 255.
-                second_tensor = pad_image(second_tensor, padding, False)
-
-                mid_list = infer_once(model, first_tensor, second_tensor, args.exp)
+                mid_list = []
+                #cv2.imwrite('debug.png', first)
                 vw.write(first)
-                for mid in mid_list:
-                    mid = (mid[0] * 255.).byte().cpu().numpy().transpose(1, 2, 0)
-                    mid = mid[:height, :, :]
-                    vw.write(mid)
+                if need_slice:
+                    pad = 256
+                    first_slice = []
+                    second_slice = []
+                    hstride = height // 2
+                    wstride = width // 2
+                    first_slice.append(first[:hstride+pad, :wstride+pad, :])
+                    first_slice.append(first[:hstride+pad, wstride-pad:, :])
+                    first_slice.append(first[hstride-pad:, :wstride+pad, :])
+                    first_slice.append(first[hstride-pad:, wstride-pad:, :])
+
+                    second_slice.append(second[:hstride+pad, :wstride+pad, :])
+                    second_slice.append(second[:hstride+pad, wstride-pad:, :])
+                    second_slice.append(second[hstride-pad:, :wstride+pad, :])
+                    second_slice.append(second[hstride-pad:, wstride-pad:, :])
+                    mid_slice_list = []
+                    padding = get_padding(hstride+pad, wstride+pad, args.scale)
+                    for i in range(4):
+                        mid_slices = interpolate(model, first_slice[i], second_slice[i], padding, args.exp)
+                        mid_slice_list.append(mid_slices)
+                    
+                    for i in range(len(mid_slice_list[0])):
+                        mid = first.copy()
+                        mid[:hstride, :wstride, :] = mid_slice_list[0][i][:hstride, :wstride, :]
+                        mid[:hstride, wstride:, :] = mid_slice_list[1][i][:hstride, pad:, :]
+                        mid[hstride:, :wstride, :] = mid_slice_list[2][i][pad:, :wstride, :]
+                        mid[hstride:, wstride:, :] = mid_slice_list[3][i][pad:, pad:, :]
+                        #cv2.imwrite('debug.png', mid)
+                        vw.write(mid)
+                else:
+                    mid_list = interpolate(model, first, second, padding, args.exp)
+                
+                    for mid in mid_list:
+                        vw.write(mid)
                     
             first = second
             pbar.update(1)
